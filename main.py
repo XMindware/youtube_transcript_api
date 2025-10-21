@@ -5,7 +5,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from openai import OpenAI
-import subprocess, os, datetime
+import subprocess, os, datetime, json
 
 # Initialize
 client = OpenAI()
@@ -33,15 +33,50 @@ class VideoRequest(BaseModel):
     video_id: str
 
 def get_youtube_transcript(video_id: str):
-    """Try to get YouTube captions."""
+    """Try to get YouTube captions in the video's own language. Returns (text, language_code)."""
     try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
-        return " ".join([t['text'] for t in transcript])
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+        preferred = None
+        for tr in transcripts:
+            if not getattr(tr, "is_generated", False):
+                preferred = tr
+                break
+        if preferred is None:
+            preferred = next(iter(transcripts))
+        entries = preferred.fetch()
+        text = " ".join([t['text'] for t in entries])
+        return text, preferred.language_code
     except (TranscriptsDisabled, NoTranscriptFound):
-        return None
+        return None, None
     except Exception as e:
         print(f"Transcript error: {e}")
-        return None
+        return None, None
+
+def get_video_info(video_id: str):
+    """Return (duration_in_seconds, language_code|None) using yt-dlp JSON output."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "--no-warnings",
+                "--dump-json",
+                "--skip-download",
+                url,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # Some videos/playlists may output multiple lines; take the first JSON object
+        first_line = result.stdout.splitlines()[0] if result.stdout else "{}"
+        data = json.loads(first_line)
+        duration = data.get("duration")
+        language_code = data.get("language")
+        return (int(duration) if duration is not None else 0, language_code)
+    except Exception as e:
+        print(f"Duration fetch error: {e}")
+        return (0, None)
 
 def download_audio(video_id: str, output_file="audio.mp3"):
     """Download audio using yt-dlp."""
@@ -61,9 +96,35 @@ def summarize_text(text: str):
     """Summarize transcript using GPT."""
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{
+        messages=[
+            {
+                "role": "system",
+                "content": """You are an assistant that summarizes YouTube videos in a structured, clear, and insightful way.
+Always respond in the same language as the provided transcript.
+Your tone should be concise and intelligent, occasionally using emojis as visual markers.
+When the video is argumentative or analytical, extract and format the content like this:
+
+🎯 Main Argument:
+<1–2 sentence core idea>
+
+🔍 Key Takeaways & Themes:
+- Use bold subheadings and emojis for categories
+- Provide brief but complete bullets (each with its own short explanation)
+- Add names, events, or facts when relevant
+
+📌 Conclusion:
+<Wrap-up of core takeaway or what this means going forward>
+
+If the video is a tutorial or guide, instead focus on:
+- 🎓 Purpose
+- 🔧 Steps / Instructions
+- ✅ Final Outcome
+
+Avoid unnecessary fluff. Focus on clarity and high-level insight.""",
+            },
+            {
             "role": "user",
-            "content": f"Summarize this YouTube transcript in 3-5 sentences:\n\n{text}"
+            "content": f"This is the transcript of a YouTube video. Please give a short, clear explanation of what the video is about:\n\n{text}"
         }]
     )
     return response.choices[0].message.content.strip()
@@ -83,15 +144,28 @@ async def summarize_video(req: VideoRequest):
     if not video_id:
         raise HTTPException(status_code=400, detail="Missing video_id")
 
-    text = get_youtube_transcript(video_id)
+    text, detected_language = get_youtube_transcript(video_id)
     source = "youtube"
 
     if not text:
         try:
+            # Enforce 10-minute max for free tier when falling back to audio transcription
+            duration_sec, lang_code = get_video_info(video_id)
+            if duration_sec and duration_sec > 600:
+                msg = (
+                    "La versión gratuita solo admite audios de menos de 10 minutos."
+                    if (lang_code or "").startswith("es") else
+                    "Free version only supports less than 10min audios."
+                )
+                raise HTTPException(status_code=400, detail=msg)
             audio_path = download_audio(video_id)
             text = transcribe_with_whisper(audio_path)
             os.remove(audio_path)
             source = "whisper"
+            detected_language = lang_code
+        except HTTPException as http_err:
+            # Propagate intended HTTP errors (e.g., 400 for duration limit)
+            raise http_err
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
