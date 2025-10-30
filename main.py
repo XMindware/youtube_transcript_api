@@ -6,6 +6,26 @@ from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from openai import OpenAI
 import subprocess, os, datetime, json
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Logging config
+logger = logging.getLogger("yt_transcript_api")
+logger.setLevel(logging.INFO)
+
+# Ensure logs directory exists
+os.makedirs("logs", exist_ok=True)
+
+# Log rotation: 5 archivos de hasta 5MB cada uno
+handler = RotatingFileHandler("logs/app.log", maxBytes=5*1024*1024, backupCount=5)
+formatter = logging.Formatter(
+    "%(asctime)s - %(levelname)s - %(message)s"
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# Ejemplo de uso
+logger.info("Starting FastAPI YouTube Transcript service...")
 
 # Initialize
 client = OpenAI()
